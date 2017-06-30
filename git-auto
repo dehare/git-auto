@@ -1,0 +1,341 @@
+#!/bin/bash
+
+# Name: Git Auto Brancher
+# Description: Automated branch creator aimed at issue trackers - asserting 'Git Flow'
+# Requirements: Bash compatible shell; GIT
+#
+# Creator: Valentijn Verhallen
+# Github: dehare
+# License: MIT (http://opensource.org/licenses/MIT)
+
+NAME="git-auto"
+CONFIG="$HOME/.config/$NAME.conf"
+
+if [ ! -f "$CONFIG" ]; then
+    touch $CONFIG
+    echo "declare -A PROJECTS" >> "$CONFIG" # new array
+fi
+
+source "$CONFIG"
+
+PWD=`pwd`
+DBG=0
+
+declare -A MODES
+MODES[f]="feature"
+MODES[h]="hotfix"
+MODES[r]="release"
+MODES[t]="tag"
+MODES[cfg]="config" # internal
+
+MODE="feature" # default mode
+MODE_LOCK=0
+MODE_PATCH=0 # creates patch tag
+HAS_STASH=1
+STASH_ADD=1
+BRANCH=""
+BRANCH_PREFIX=1
+BRANCH_LOCK=0
+BRANCH_UPDATE=1
+PUSH_TAGS=1
+PUSH_AFTER_STASH=0
+PUSH_COMMIT_MSG=""
+
+showHelp() {
+    echo -e "Usage: $NAME [-f=feature; -h=hotfix; -r=release; -t=tag]\n\t[-b BRANCH_NAME]\n\t[-p PUSH MESSAGE]\n\t[--dirty = don't update]\n\t[--patch]\n\t[--verbose]\n\t[--config]\n\t[BRANCH/TAG NAME]"
+    exit 0
+}
+
+# description
+# title
+# default value
+### copy from SHF Main (@dehare) ##
+function entry
+{
+    local title=""
+    local default=""
+
+    if [ "$2" ]; then
+        title="$2"
+    fi
+    if [ "$3" ]; then
+        default="$3"
+    fi
+
+    if [ "$default" ]; then
+        default="($3)"
+    fi
+    read -e -p "$title - $1: $default" ENTRY
+}
+
+debug() {
+    if [ $DBG -eq 1 ]; then
+        echo -e "DEBUG: $1"
+    fi
+}
+
+parseOpts () {
+    while getopts "fhrtp:b:-:" optname
+    do
+      case "$optname" in
+        f|h|r|t)
+            if [ $MODE_LOCK -eq 0 ]; then
+                MODE=${MODES[$optname]}
+                MODE_LOCK=1 # prohibit multiple modes
+            fi
+            ;;
+        b)
+            BRANCH="$OPTARG"
+            BRANCH_PREFIX=0
+            BRANCH_LOCK=1 # prohibit parseArgs to set branch name
+            ;;
+        p)
+            PUSH_AFTER_STASH=1
+            PUSH_COMMIT_MSG="$OPTARG"
+            ;;
+        -)
+            case "${OPTARG}" in
+                dirty)  BRANCH_UPDATE=0 ;; # checkout tracked branch without updating
+                patch)  MODE_PATCH=1 ;; # dont stage changes
+                no-stage)  STASH_ADD=0 ;; # dont stage changes
+                no-push)  PUSH_TAGS=0 ;; # dont push tag
+                verbose|debug) DBG=1 ;; # turn on debug messages
+                config|configure)
+                    MODE=${MODES[cfg]}
+                    MODE_LOCK=1 # prohibit multiple modes
+                    ;;
+                help) showHelp ;;
+            esac
+            ;;
+      esac
+    done
+
+    return $OPTIND
+}
+
+parseArgs () {
+    for p in "$@"; do
+        case "$p" in
+            *)  # blank argument
+                if [ $BRANCH_LOCK -eq 0 ]; then
+                    BRANCH="$p"
+                    BRANCH_PREFIX=0
+                    BRANCH_LOCK=1
+                else
+                    debug "Cannot modify branch name\nLock: -b $BRANCH"
+                fi
+            ;;
+        esac
+    done
+}
+
+app_config() {
+    project=${PWD##*/}
+    prj_prefix=""
+    prj_prefix_known=0
+
+    if [ ! -z "${PROJECTS[$project]}" ]; then
+        prj_prefix="${PROJECTS[$project]}"
+        prj_prefix_known=1
+        debug "Found prefix for $project: $prj_prefix"
+
+        if [ "$BRANCH" ]; then
+            debug "Branch argument supplied, assuming new prefix"
+            prj_prefix="$BRANCH"
+        fi
+
+        entry "Set new prefix for project $project" "Enter prefix" "$prj_prefix"
+        if [[ "$ENTRY" != "$prj_prefix" ]]; then
+            prj_prefix=${ENTRY:=$prj_prefix}
+        fi
+    else
+        entry "No project prefix defined for $project" "Enter prefix"
+        prj_prefix=${ENTRY:=$prj_prefix}
+    fi
+
+    # remove old configuration
+    if [ $prj_prefix_known -eq 1 ]; then
+        sed -i "/$project/d" "$CONFIG"
+    fi
+
+    if [ ! -z "$prj_prefix" ]; then
+        echo "Configuring prefix for $project: $prj_prefix"
+        echo "PROJECTS[$project]=\"$prj_prefix\"" >> "$CONFIG" # write to config
+        PROJECTS[$project]="$prj_prefix"
+    fi
+}
+
+setup() {
+    parseOpts "$@"
+    argstart=$?
+    parseArgs "${@:$argstart}"
+}
+
+validateSetup() {
+    if [ $# -eq 0 ] || ( [[ "$MODE" != "tag" ]] && [[ "$MODE" != "config" ]] && [ -z "$BRANCH" ] ); then
+        showHelp
+    fi
+
+    debug "Checking if current dir is a repository"
+    # CHECK FOR REPOSITORY
+    if [ ! -e "$PWD/.git" ]; then
+        echo -e "Error: Not a git repository"
+        exit 1
+    fi
+
+    debug "Validating branch"
+    if [[ "$MODE" != "tag" ]] && [[ "$MODE" != "config" ]] && [ -z "$BRANCH" ]; then
+        echo -e "Error: No branch name supplied"
+        exit 2
+    fi
+    debug "Supplied branch name = $BRANCH"
+}
+
+stash() {
+    if [[ $STASH_ADD ]]; then
+        echo -e "Staging all changed files"
+        `git add . > /dev/null 2>&1`
+    fi
+
+    stash_state=$(git stash)
+    if [[ "${stash_state,,}" == "no local changes"* ]]; then
+        HAS_STASH=0
+    else
+        echo -e "Stashing all changes"
+    fi
+
+    # Update major branch
+    if [ $BRANCH_UPDATE -eq 1 ]; then
+        branch_update_tracked
+    fi
+}
+
+stash_apply() {
+    if [ $HAS_STASH -eq 1 ]; then
+        echo -e "Applying stashed files"
+        `git stash apply > /dev/null 2>&1`
+
+        if [ $PUSH_AFTER_STASH -eq 1 ]; then
+            git commit -am "$BRANCH | $PUSH_COMMIT_MSG"
+            git push --porcelain --recurse-submodules=check origin "refs/heads/$MODE/$BRANCH":"refs/heads/$MODE/$BRANCH"
+            git branch --set-upstream-to="origin/heads/$MODE/$BRANCH" "$MODE/$BRANCH"
+        fi
+    fi
+}
+
+branch() {
+    project=${PWD##*/}
+    prefix=""
+    prj_prefix=""
+
+    # custom prefix in name
+    if [[ "$BRANCH" =~ ^([A-Z]+)-(.*)$ ]]; then
+        prefix=${BRANCH%%-*}
+        debug "Found custom prefix: $prefix"
+    fi
+
+    debug "Finding prefix for $project"
+    if [ ! -z "${PROJECTS[$project]}" ]; then
+        prj_prefix="${PROJECTS[$project]}"
+        debug "Found prefix for $project: $prj_prefix"
+    else
+        entry "No project prefix defined for $project" "Enter prefix"
+        prj_prefix=${prj_prefix:=$ENTRY}
+        echo -e "New prefix for $project: $prj_prefix"
+        if [ ! -z "$prj_prefix" ]; then
+            echo "PROJECTS[$project]=\"$prj_prefix\"" >> "$CONFIG" # write to config
+            PROJECTS[$project]="$prj_prefix"
+        fi
+    fi
+
+    if [ ! -z "$prj_prefix" ] && [ ! -z "$prefix" ] && [[ "$prj_prefix" != "$prefxi" ]]; then
+        prefix_dft="$prj_prefix-$prefix"
+        entry "Enter desired prefix" "Prefix $prefix differs from project default $prj_prefix" "$prefix_dft"
+        prefix=${ENTRY:=$prefix_dft}
+    elif [ -z "$prefix" ] && [ ! -z "$prj_prefix" ]; then
+        prefix="$prj_prefix"
+    fi
+
+    # Add prefix to branch
+    if [[ "$BRANCH" != "$prefix"* ]]; then
+        BRANCH="$prefix-$BRANCH"
+    fi
+
+    echo -e "Creating branch $MODE/$BRANCH"
+    `git checkout -b "$MODE/$BRANCH" > /dev/null 2>&1`
+}
+
+branch_update_tracked() {
+    tracked="master"
+    #  todo check if exists
+    if [[ $MODE == "feature" ]] || [[ $MODE == "release" ]]; then
+        tracked="develop"
+    fi
+
+    debug "Updating $tracked.."
+    `git checkout "$tracked" > /dev/null 2>&1`
+    `git pull > /dev/null 2>&1`
+}
+
+# Status: WIP
+# will check for last (logical) tag and increase version number
+tag() {
+    local git_status=$(git status)
+
+    if [[ "${git_status,,}" ==  *"changes"* ]]; then
+        entry "Continue? [y/n]" "Uncommitted changes"
+        case "${ENTRY,,}" in
+            y|yes) debug "Continuing tag" ;;
+            n|no|*)
+                echo -e "Aborting tag"
+                exit 0 ;;
+        esac
+
+        stash
+    else
+        debug "Working on clean repository"
+    fi
+
+    if [ -z "$BRANCH" ]; then
+        debug "Getting latest tag"
+        IFS=$'\n'
+
+        local t=($(git tag -l))
+        if [ ! -z "$t" ]; then
+            local last=${t[-1]}
+            local lc=${last##*.}
+            local lc1="$(($lc + 1))"
+            local new=$(echo "$last" | sed "s/$lc/$lc1/g")
+
+            debug "Last tag found: $last"
+            entry "Continue? [y/n/TAG NAME]" "New tag: $new"
+        fi
+
+        unset IFS
+
+        exit
+    fi
+
+    echo -e "Create new tag & push"
+    echo -e "Not yet implemented"
+    exit 0
+}
+
+
+# FLOW
+setup "$@"
+validateSetup "$@"
+echo -e "Preparing $MODE..."
+
+if [[ $MODE == "tag" ]]; then
+    tag
+elif [[ $MODE == "config" ]]; then
+    app_config
+else
+    stash
+    branch
+    stash_apply
+    echo -e "Done"
+fi
+
+exit 0
