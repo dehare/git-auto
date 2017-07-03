@@ -50,8 +50,7 @@ showHelp() {
 # title
 # default value
 ### copy from SHF Main (@dehare) ##
-function entry
-{
+entry() {
     local title=""
     local default=""
 
