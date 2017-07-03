@@ -16,6 +16,7 @@ Jamie is working on a hotfix for 'Epic WebApp'. After editing 15 files he discov
 
 Git-auto provides the solution! Simply typing `git-auto -h 676` and EA-676* is automatically created with all changes made, ready to be committed. Simply adding the argument `-p <commit message>` would even commit and push the changes made.
 
+*: EA is a configured prefix for this project. Configuration is invoked the first time your initiate the app in a project.
 
 ## Options
 
